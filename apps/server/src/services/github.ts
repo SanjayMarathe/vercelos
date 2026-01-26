@@ -174,10 +174,29 @@ export class GitHubService {
     path: string = ""
   ): Promise<string> {
     const contents: string[] = [];
-    const maxFiles = 20; // Limit files to avoid token limits
+    const maxFiles = 40; // Increased limit for better context
     let fileCount = 0;
 
-    const fetchContents = async (currentPath: string): Promise<void> => {
+    // Priority directories to scan first (most likely to contain important code)
+    const priorityDirs = ["src", "app", "components", "lib", "pages", "hooks", "utils", "services"];
+    const skipDirs = new Set([
+      "node_modules", ".git", "dist", "build", ".next", "coverage",
+      ".cache", ".turbo", "out", "__pycache__", ".venv", "venv",
+      "vendor", "target", "bin", "obj", ".idea", ".vscode"
+    ]);
+
+    const codeExtensions = new Set([
+      "ts", "tsx", "js", "jsx", "py", "go", "rs", "java", "kt",
+      "json", "yaml", "yml", "css", "scss", "less", "html", "vue", "svelte"
+    ]);
+
+    // Files to always include if they exist
+    const importantFiles = new Set([
+      "package.json", "tsconfig.json", "next.config.js", "next.config.ts",
+      "vite.config.ts", "tailwind.config.js", "tailwind.config.ts"
+    ]);
+
+    const fetchContents = async (currentPath: string, priority: number = 0): Promise<void> => {
       if (fileCount >= maxFiles) return;
 
       try {
@@ -188,53 +207,41 @@ export class GitHubService {
         });
 
         if (Array.isArray(data)) {
-          // Directory
-          for (const item of data) {
+          // Sort: prioritize directories and important files
+          const sorted = data.sort((a, b) => {
+            const aIsPriority = priorityDirs.includes(a.name) ? 1 : 0;
+            const bIsPriority = priorityDirs.includes(b.name) ? 1 : 0;
+            const aIsImportant = importantFiles.has(a.name) ? 1 : 0;
+            const bIsImportant = importantFiles.has(b.name) ? 1 : 0;
+            return (bIsPriority + bIsImportant) - (aIsPriority + aIsImportant);
+          });
+
+          for (const item of sorted) {
             if (fileCount >= maxFiles) break;
 
-            // Skip common non-essential directories
-            if (
-              item.name === "node_modules" ||
-              item.name === ".git" ||
-              item.name === "dist" ||
-              item.name === "build" ||
-              item.name === ".next" ||
-              item.name === "coverage"
-            ) {
+            // Skip non-essential directories
+            if (skipDirs.has(item.name) || item.name.startsWith(".")) {
               continue;
             }
 
             if (item.type === "dir") {
-              await fetchContents(item.path);
+              // Prioritize scanning important directories
+              const dirPriority = priorityDirs.includes(item.name) ? priority : priority + 1;
+              if (dirPriority <= 2) { // Only go 2 levels deep for non-priority dirs
+                await fetchContents(item.path, dirPriority);
+              }
             } else if (item.type === "file") {
-              // Only fetch code files
               const ext = item.name.split(".").pop()?.toLowerCase();
-              const codeExtensions = [
-                "ts",
-                "tsx",
-                "js",
-                "jsx",
-                "py",
-                "go",
-                "rs",
-                "java",
-                "json",
-                "yaml",
-                "yml",
-                "md",
-                "css",
-                "scss",
-              ];
+              const isCodeFile = ext && codeExtensions.has(ext);
+              const isImportant = importantFiles.has(item.name);
 
-              if (ext && codeExtensions.includes(ext) && item.size < 50000) {
+              if ((isCodeFile || isImportant) && item.size < 50000) {
                 try {
-                  const { data: fileData } = await this.octokit.repos.getContent(
-                    {
-                      owner,
-                      repo,
-                      path: item.path,
-                    }
-                  );
+                  const { data: fileData } = await this.octokit.repos.getContent({
+                    owner,
+                    repo,
+                    path: item.path,
+                  });
 
                   if (!Array.isArray(fileData) && fileData.type === "file") {
                     const content = Buffer.from(
@@ -258,6 +265,8 @@ export class GitHubService {
 
     await fetchContents(path);
 
-    return contents.join("\n");
+    // Add a summary at the top
+    const summary = `Repository: ${owner}/${repo}\nFiles analyzed: ${fileCount}\n`;
+    return summary + contents.join("\n");
   }
 }

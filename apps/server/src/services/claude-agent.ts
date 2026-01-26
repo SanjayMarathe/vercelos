@@ -205,6 +205,87 @@ Return only the prompt text, no explanations.`,
     return textContent.text;
   }
 
+  async generateCodeChanges(
+    userRequest: string,
+    codebaseContent: string,
+    intent: Intent
+  ): Promise<{
+    files: Array<{ path: string; content: string; action: "create" | "modify" }>;
+    summary: string;
+    explanation: string;
+  }> {
+    const systemPrompt = `You are an expert software engineer. Your task is to analyze an existing codebase and generate specific code changes based on the user's request.
+
+IMPORTANT RULES:
+1. You MUST understand the existing codebase structure, patterns, and conventions before making changes
+2. Match the existing code style (indentation, naming conventions, patterns)
+3. If modifying an existing file, include the COMPLETE new file content
+4. If creating a new file, ensure it integrates properly with existing imports/exports
+5. Consider where new components should be placed based on the existing folder structure
+6. Use existing dependencies and patterns from the codebase
+7. Make minimal, focused changes - don't refactor unrelated code
+
+Respond with JSON only in this exact format:
+{
+  "files": [
+    {
+      "path": "relative/path/to/file.tsx",
+      "content": "complete file content here",
+      "action": "create" | "modify"
+    }
+  ],
+  "summary": "Brief description of changes for PR title",
+  "explanation": "Detailed explanation of what was changed and why"
+}`;
+
+    try {
+      const response = await this.client.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 8192,
+        system: systemPrompt,
+        messages: [
+          {
+            role: "user",
+            content: `## User Request
+"${userRequest}"
+
+## Analyzed Intent
+- Type: ${intent.type}
+- Description: ${intent.description}
+- Component Type: ${intent.componentType || "Not specified"}
+- Styling hints: ${intent.styling?.join(", ") || "None"}
+
+## Existing Codebase
+${codebaseContent}
+
+## Task
+Based on the user's request and the existing codebase above, generate the necessary code changes. Make sure your changes integrate properly with the existing code structure and patterns.`,
+          },
+        ],
+      });
+
+      const textContent = response.content.find((c) => c.type === "text");
+      if (!textContent || textContent.type !== "text") {
+        throw new Error("No text response from Claude");
+      }
+
+      const jsonMatch = textContent.text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        throw new Error("Could not parse code changes from response");
+      }
+
+      const result = JSON.parse(jsonMatch[0]);
+      return {
+        files: result.files || [],
+        summary: result.summary || intent.description,
+        explanation: result.explanation || "Code changes generated based on request",
+      };
+    } catch (error) {
+      console.error("Code generation error:", error);
+      throw error;
+    }
+  }
+
   async analyzeSentinel(
     agentId: string,
     repoContent: string

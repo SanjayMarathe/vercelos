@@ -326,26 +326,12 @@ async function runPipeline(
   if (!socket) return;
 
   try {
-    // Step 1: Generate code with v0
-    console.log(`\n[TOOL CALL] v0.generateCode`);
-    console.log(`[INPUT] Prompt: "${session.intent!.description}"`);
-    updateStatus(socket, {
-      stage: "generating",
-      message: "Generating code with v0...",
-    });
-
-    const generatedCode = await orchestrator.generateCode({
-      prompt: session.intent!.description,
-      componentType: session.intent!.componentType,
-      styling: session.intent!.styling,
-    });
-    console.log(`[TOOL RESULT] Generated ${generatedCode.filePath} (${generatedCode.code.length} chars)`);
-
-    session.generatedCode = generatedCode;
-    socket.emit("code_generated", generatedCode);
-
     let owner: string;
     let repoName: string;
+    let codebaseContent = "";
+    let filesToPush: Array<{ path: string; content: string }> = [];
+    let prSummary = session.intent!.description;
+    let prExplanation = "";
 
     // Check if using existing repo or creating new one
     if (session.targetRepo) {
@@ -358,12 +344,63 @@ async function runPipeline(
       repoName = parts[1];
       console.log(`[REPO] Using existing repository: ${owner}/${repoName}`);
 
+      // Step 1: Fetch existing codebase
+      console.log(`\n[TOOL CALL] github.getRepositoryContents`);
+      updateStatus(socket, {
+        stage: "analyzing",
+        message: "Reading existing codebase...",
+      });
+
+      codebaseContent = await orchestrator.getRepositoryContents(owner, repoName);
+      console.log(`[TOOL RESULT] Fetched ${codebaseContent.length} chars of codebase`);
+
+      if (!codebaseContent.trim()) {
+        console.log("[WARNING] Empty codebase, will create new files");
+      }
+
+      // Step 2: Use Claude to generate contextual code changes
+      console.log(`\n[TOOL CALL] claude.generateCodeChanges`);
+      console.log(`[INPUT] Request: "${session.transcript}"`);
+      updateStatus(socket, {
+        stage: "generating",
+        message: "Analyzing codebase and generating changes...",
+      });
+
+      const claudeAgent = new ClaudeAgent(process.env.ANTHROPIC_API_KEY!);
+      const codeChanges = await claudeAgent.generateCodeChanges(
+        session.transcript,
+        codebaseContent,
+        session.intent!
+      );
+
+      console.log(`[TOOL RESULT] Generated ${codeChanges.files.length} file changes`);
+      for (const file of codeChanges.files) {
+        console.log(`  - ${file.action}: ${file.path} (${file.content.length} chars)`);
+      }
+
+      filesToPush = codeChanges.files.map((f) => ({ path: f.path, content: f.content }));
+      prSummary = codeChanges.summary;
+      prExplanation = codeChanges.explanation;
+
+      // Emit code generated event with first file
+      if (codeChanges.files.length > 0) {
+        const firstFile = codeChanges.files[0];
+        session.generatedCode = {
+          code: firstFile.content,
+          language: "typescript",
+          filePath: firstFile.path,
+          explanation: codeChanges.explanation,
+        };
+        socket.emit("code_generated", session.generatedCode);
+      }
+
       updateStatus(socket, {
         stage: "creating_repo",
-        message: `Using repository ${owner}/${repoName}...`,
+        message: `Preparing changes for ${owner}/${repoName}...`,
       });
+
     } else {
-      // Step 2: Create new repository (fallback behavior)
+      // Create new repository (fallback behavior for no target repo)
       console.log(`\n[TOOL CALL] github.createRepository`);
       repoName = `voice-vision-${Date.now()}`;
       console.log(`[INPUT] Name: ${repoName}`);
@@ -380,7 +417,23 @@ async function runPipeline(
       owner = repo.owner;
       console.log(`[TOOL RESULT] Created repo: ${owner}/${repoName}`);
 
-      // Step 3: Push initial README to main branch (only for new repos)
+      // For new repos, use v0/Claude to generate initial code
+      console.log(`\n[TOOL CALL] Generating initial code for new repo`);
+      updateStatus(socket, {
+        stage: "generating",
+        message: "Generating code...",
+      });
+
+      const generatedCode = await orchestrator.generateCode({
+        prompt: session.intent!.description,
+        componentType: session.intent!.componentType,
+        styling: session.intent!.styling,
+      });
+
+      session.generatedCode = generatedCode;
+      socket.emit("code_generated", generatedCode);
+
+      // Push initial README to main branch
       console.log(`\n[TOOL CALL] github.pushFiles (README to main)`);
       updateStatus(socket, {
         stage: "pushing",
@@ -399,14 +452,33 @@ async function runPipeline(
           },
         ],
       });
-      console.log(`[TOOL RESULT] Pushed README to main branch`);
+
+      filesToPush = [
+        { path: generatedCode.filePath, content: generatedCode.code },
+        {
+          path: "package.json",
+          content: JSON.stringify(
+            {
+              name: repoName,
+              version: "1.0.0",
+              dependencies: {
+                react: "^19.0.0",
+                "react-dom": "^19.0.0",
+                tailwindcss: "^3.4.0",
+              },
+            },
+            null,
+            2
+          ),
+        },
+      ];
     }
 
-    // Step 4: Create feature branch with unique name
+    // Create feature branch with unique name
     console.log(`\n[TOOL CALL] github.createBranch`);
     const branchName = session.targetRepo
-      ? `feature/voice-generated-${Date.now()}`  // Unique branch for existing repos
-      : "feature/voice-generated";                // Static branch for new repos
+      ? `feature/voice-generated-${Date.now()}`
+      : "feature/voice-generated";
     console.log(`[INPUT] Branch: ${branchName}`);
     await orchestrator.createBranch({
       owner: owner,
@@ -416,69 +488,50 @@ async function runPipeline(
     });
     console.log(`[TOOL RESULT] Created branch: ${branchName}`);
 
-    // Step 5: Push generated code to feature branch
+    // Push code changes to feature branch
+    if (filesToPush.length === 0) {
+      throw new Error("No files to push. Code generation may have failed.");
+    }
+
     console.log(`\n[TOOL CALL] github.pushFiles (code to feature branch)`);
-    console.log(`[INPUT] Files: ${generatedCode.filePath}`);
+    console.log(`[INPUT] Files: ${filesToPush.map((f) => f.path).join(", ")}`);
     updateStatus(socket, {
       stage: "pushing",
-      message: "Pushing generated code...",
+      message: `Pushing ${filesToPush.length} file(s)...`,
     });
-
-    // Only include package.json for new repos
-    const filesToPush = session.targetRepo
-      ? [{ path: generatedCode.filePath, content: generatedCode.code }]
-      : [
-          { path: generatedCode.filePath, content: generatedCode.code },
-          {
-            path: "package.json",
-            content: JSON.stringify(
-              {
-                name: repoName,
-                version: "1.0.0",
-                dependencies: {
-                  react: "^19.0.0",
-                  "react-dom": "^19.0.0",
-                  tailwindcss: "^3.4.0",
-                },
-              },
-              null,
-              2
-            ),
-          },
-        ];
 
     await orchestrator.pushFiles({
       owner: owner,
       repo: repoName,
       branch: branchName,
-      message: "feat: add generated component from VercelOS",
+      message: `feat: ${prSummary}`,
       files: filesToPush,
     });
-    console.log(`[TOOL RESULT] Pushed files to feature branch`);
+    console.log(`[TOOL RESULT] Pushed ${filesToPush.length} files to feature branch`);
 
-    // Step 6: Create Pull Request
+    // Create Pull Request
     console.log(`\n[TOOL CALL] github.createPullRequest`);
-    console.log(`[INPUT] Title: feat: ${session.intent!.description}`);
+    console.log(`[INPUT] Title: ${prSummary}`);
     updateStatus(socket, {
       stage: "creating_pr",
       message: "Creating pull request...",
     });
 
+    const filesList = filesToPush.map((f) => `- \`${f.path}\``).join("\n");
     const prResult = await orchestrator.createPullRequest({
       owner: owner,
       repo: repoName,
-      title: `feat: ${session.intent!.description}`,
+      title: prSummary,
       body: `## VercelOS Generated PR
 
 **Voice Command:** "${session.transcript}"
 
-**Generated Component:** ${session.intent!.componentType || "UI Component"}
-
+${prExplanation ? `### What Changed\n${prExplanation}\n` : ""}
 ### Files Changed
-- \`${generatedCode.filePath}\`
+${filesList}
 
 ---
-*Generated by [VercelOS](https://github.com/voice-vision)*`,
+*Generated by [VercelOS](https://github.com/voice-vision) - Voice-to-PR with codebase context*`,
       head: branchName,
       base: "main",
     });
