@@ -1,0 +1,394 @@
+import express from "express";
+import { createServer } from "http";
+import { Server } from "socket.io";
+import cors from "cors";
+import dotenv from "dotenv";
+import { DeepgramService } from "./services/deepgram.js";
+import { ClaudeAgent } from "./services/claude-agent.js";
+import { MCPOrchestrator } from "./services/mcp-orchestrator.js";
+import type {
+  ServerToClientEvents,
+  ClientToServerEvents,
+  SessionState,
+  PipelineStatus,
+} from "./types/index.js";
+
+dotenv.config();
+
+const app = express();
+const httpServer = createServer(app);
+
+// Configure CORS for Socket.io
+const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
+  maxHttpBufferSize: 1e8, // 100MB for audio chunks
+  transports: ["polling", "websocket"],
+  allowUpgrades: true,
+  pingTimeout: 60000,
+  pingInterval: 25000,
+});
+
+app.use(cors());
+app.use(express.json());
+
+// Health check endpoint
+app.get("/health", (_, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// Store active sessions
+const sessions = new Map<string, SessionState>();
+
+io.on("connection", (socket) => {
+  console.log(`Client connected: ${socket.id}`);
+
+  let deepgramService: DeepgramService | null = null;
+  let claudeAgent: ClaudeAgent | null = null;
+  let orchestrator: MCPOrchestrator | null = null;
+  let accumulatedTranscript = "";
+
+  // Initialize services
+  const initializeServices = () => {
+    // Initialize Deepgram
+    deepgramService = new DeepgramService(process.env.DEEPGRAM_API_KEY!);
+
+    // Initialize Claude Agent
+    claudeAgent = new ClaudeAgent(process.env.ANTHROPIC_API_KEY!);
+
+    // Initialize MCP Orchestrator
+    orchestrator = new MCPOrchestrator({
+      githubToken: process.env.GITHUB_TOKEN!,
+      v0ApiKey: process.env.V0_API_KEY!,
+      vercelToken: process.env.VERCEL_TOKEN,
+    });
+  };
+
+  // Handle session start
+  socket.on("start_session", async (config) => {
+    console.log(`Starting session for ${socket.id}`, config);
+
+    try {
+      initializeServices();
+
+      // Create session state
+      const session: SessionState = {
+        id: socket.id,
+        transcript: "",
+        intent: null,
+        generatedCode: null,
+        prResult: null,
+        status: { stage: "idle", message: "Session started" },
+        createdAt: new Date(),
+      };
+      sessions.set(socket.id, session);
+
+      // Initialize Deepgram (pre-recorded mode - just buffers audio)
+      await deepgramService!.connect();
+
+      updateStatus(socket, {
+        stage: "recording",
+        message: "Recording... Tap to stop.",
+      });
+    } catch (error) {
+      console.error("Failed to start session:", error);
+      socket.emit(
+        "error",
+        `Failed to start session: ${(error as Error).message}`
+      );
+    }
+  });
+
+  // Handle audio data
+  let audioChunkCount = 0;
+  let totalBytesReceived = 0;
+  socket.on("audio", async (data) => {
+    audioChunkCount++;
+    const byteLength = data.byteLength || data.length || 0;
+    totalBytesReceived += byteLength;
+
+    // Log every audio chunk for debugging
+    console.log(`[AUDIO] Chunk #${audioChunkCount}: ${byteLength} bytes (total: ${totalBytesReceived} bytes)`);
+
+    // Log first few bytes to verify WAV header
+    if (audioChunkCount === 1 && byteLength > 0) {
+      const arr = new Uint8Array(data instanceof ArrayBuffer ? data : data.buffer || data);
+      const header = Array.from(arr.slice(0, 12)).map(b => String.fromCharCode(b)).join('');
+      console.log(`[AUDIO] First bytes (expecting RIFF...WAVE): "${header}"`);
+    }
+
+    if (deepgramService) {
+      // Ensure we're sending as Buffer for Deepgram
+      const buffer = data instanceof ArrayBuffer ? Buffer.from(data) : Buffer.from(data.buffer || data);
+      deepgramService.sendAudio(buffer);
+    }
+  });
+
+  // Handle get_transcript - transcribe audio but don't process
+  socket.on("get_transcript", async () => {
+    console.log(`Getting transcript for ${socket.id}`);
+
+    try {
+      // Transcribe the buffered audio using pre-recorded API
+      let transcript = "";
+      if (deepgramService) {
+        console.log("[DEEPGRAM] Transcribing buffered audio...");
+        transcript = await deepgramService.transcribeBufferedAudio();
+        accumulatedTranscript = transcript;
+      }
+
+      console.log(`[TRANSCRIPT] Final: "${transcript}"`);
+
+      const session = sessions.get(socket.id);
+      if (session) {
+        session.transcript = transcript;
+      }
+
+      // Send transcript to client
+      socket.emit("transcript", { text: transcript, is_final: true, confidence: 1 });
+
+      updateStatus(socket, {
+        stage: "ready",
+        message: transcript ? "Ready to process" : "No speech detected",
+      });
+    } catch (error) {
+      console.error("Transcription error:", error);
+      socket.emit("error", `Transcription error: ${(error as Error).message}`);
+    }
+  });
+
+  // Handle process_session - run the full pipeline
+  socket.on("process_session", async () => {
+    console.log(`Processing session for ${socket.id}`);
+
+    try {
+      const session = sessions.get(socket.id);
+      if (!session || !accumulatedTranscript.trim()) {
+        console.log("[ERROR] No transcript to process");
+        socket.emit("error", "No transcript to process. Please speak clearly and try again.");
+        return;
+      }
+
+      // Analyze intent with Claude
+      console.log(`\n[TOOL CALL] Claude analyzeIntent`);
+      console.log(`[INPUT] Transcript: "${accumulatedTranscript}"`);
+      updateStatus(socket, {
+        stage: "analyzing",
+        message: "Analyzing your request...",
+      });
+
+      const intent = await claudeAgent!.analyzeIntent(accumulatedTranscript);
+      console.log(`[TOOL RESULT] Intent:`, JSON.stringify(intent, null, 2));
+      session.intent = intent;
+      socket.emit("intent", intent);
+
+      if (intent.type === "unknown" || intent.confidence < 0.5) {
+        console.log(`[ERROR] Intent not understood or low confidence`);
+        updateStatus(socket, {
+          stage: "error",
+          message: "Could not understand the request. Please try again.",
+        });
+        return;
+      }
+
+      // Run the pipeline
+      console.log(`\n[PIPELINE] Starting code generation pipeline`);
+      await runPipeline(socket, session, orchestrator!);
+    } catch (error) {
+      console.error("Pipeline error:", error);
+      socket.emit("error", `Pipeline error: ${(error as Error).message}`);
+      updateStatus(socket, {
+        stage: "error",
+        message: (error as Error).message,
+      });
+    }
+  });
+
+  socket.on("disconnect", () => {
+    console.log(`Client disconnected: ${socket.id}`);
+    sessions.delete(socket.id);
+    if (deepgramService) {
+      deepgramService.close();
+    }
+  });
+});
+
+// Run the Voice-to-PR pipeline
+async function runPipeline(
+  socket: ReturnType<typeof io.sockets.sockets.get>,
+  session: SessionState,
+  orchestrator: MCPOrchestrator
+) {
+  if (!socket) return;
+
+  try {
+    // Step 1: Generate code with v0
+    console.log(`\n[TOOL CALL] v0.generateCode`);
+    console.log(`[INPUT] Prompt: "${session.intent!.description}"`);
+    updateStatus(socket, {
+      stage: "generating",
+      message: "Generating code with v0...",
+    });
+
+    const generatedCode = await orchestrator.generateCode({
+      prompt: session.intent!.description,
+      componentType: session.intent!.componentType,
+      styling: session.intent!.styling,
+    });
+    console.log(`[TOOL RESULT] Generated ${generatedCode.filePath} (${generatedCode.code.length} chars)`);
+
+    session.generatedCode = generatedCode;
+    socket.emit("code_generated", generatedCode);
+
+    // Step 2: Create repository
+    console.log(`\n[TOOL CALL] github.createRepository`);
+    const repoName = `voice-vision-${Date.now()}`;
+    console.log(`[INPUT] Name: ${repoName}`);
+    updateStatus(socket, {
+      stage: "creating_repo",
+      message: "Creating GitHub repository...",
+    });
+
+    const repo = await orchestrator.createRepository({
+      name: repoName,
+      description: `Generated by VercelOS: ${session.intent!.description}`,
+      private: true,
+    });
+    console.log(`[TOOL RESULT] Created repo: ${repo.owner}/${repo.name}`);
+
+    // Step 3: Push initial README to main branch
+    console.log(`\n[TOOL CALL] github.pushFiles (README to main)`);
+    updateStatus(socket, {
+      stage: "pushing",
+      message: "Setting up repository...",
+    });
+
+    await orchestrator.pushFiles({
+      owner: repo.owner,
+      repo: repo.name,
+      branch: "main",
+      message: "chore: initial commit",
+      files: [
+        {
+          path: "README.md",
+          content: `# ${repoName}\n\nGenerated by VercelOS\n`,
+        },
+      ],
+    });
+    console.log(`[TOOL RESULT] Pushed README to main branch`);
+
+    // Step 4: Create feature branch
+    console.log(`\n[TOOL CALL] github.createBranch`);
+    const branchName = "feature/voice-generated";
+    console.log(`[INPUT] Branch: ${branchName}`);
+    await orchestrator.createBranch({
+      owner: repo.owner,
+      repo: repo.name,
+      branch: branchName,
+      fromBranch: "main",
+    });
+    console.log(`[TOOL RESULT] Created branch: ${branchName}`);
+
+    // Step 5: Push generated code to feature branch
+    console.log(`\n[TOOL CALL] github.pushFiles (code to feature branch)`);
+    console.log(`[INPUT] Files: ${generatedCode.filePath}, package.json`);
+    updateStatus(socket, {
+      stage: "pushing",
+      message: "Pushing generated code...",
+    });
+
+    await orchestrator.pushFiles({
+      owner: repo.owner,
+      repo: repo.name,
+      branch: branchName,
+      message: "feat: add generated component from Voice Vision",
+      files: [
+        {
+          path: generatedCode.filePath,
+          content: generatedCode.code,
+        },
+        {
+          path: "package.json",
+          content: JSON.stringify(
+            {
+              name: repoName,
+              version: "1.0.0",
+              dependencies: {
+                react: "^19.0.0",
+                "react-dom": "^19.0.0",
+                tailwindcss: "^3.4.0",
+              },
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    });
+    console.log(`[TOOL RESULT] Pushed files to feature branch`);
+
+    // Step 6: Create Pull Request
+    console.log(`\n[TOOL CALL] github.createPullRequest`);
+    console.log(`[INPUT] Title: feat: ${session.intent!.description}`);
+    updateStatus(socket, {
+      stage: "creating_pr",
+      message: "Creating pull request...",
+    });
+
+    const prResult = await orchestrator.createPullRequest({
+      owner: repo.owner,
+      repo: repo.name,
+      title: `feat: ${session.intent!.description}`,
+      body: `## VercelOS Generated PR
+
+**Voice Command:** "${session.transcript}"
+
+**Generated Component:** ${session.intent!.componentType || "UI Component"}
+
+### Files Changed
+- \`${generatedCode.filePath}\`
+
+---
+*Generated by [VercelOS](https://github.com/voice-vision)*`,
+      head: branchName,
+      base: "main",
+    });
+    console.log(`[TOOL RESULT] Created PR #${prResult.number}: ${prResult.url}`);
+
+    session.prResult = prResult;
+    socket.emit("pr_created", prResult);
+
+    updateStatus(socket, {
+      stage: "complete",
+      message: "Pull request created successfully!",
+      data: { prUrl: prResult.url, repoUrl: prResult.repoUrl },
+    });
+    console.log(`\n[PIPELINE COMPLETE] PR created successfully!`);
+  } catch (error) {
+    console.error("[PIPELINE ERROR]", error);
+    throw error;
+  }
+}
+
+function updateStatus(
+  socket: ReturnType<typeof io.sockets.sockets.get>,
+  status: PipelineStatus
+) {
+  if (socket) {
+    socket.emit("status", status);
+    const session = sessions.get(socket.id);
+    if (session) {
+      session.status = status;
+    }
+  }
+}
+
+const PORT = process.env.PORT || 3001;
+const HOST = '0.0.0.0';
+
+httpServer.listen(Number(PORT), HOST, () => {
+  console.log(`Voice Vision server running on http://${HOST}:${PORT}`);
+  console.log(`WebSocket ready for connections`);
+});
