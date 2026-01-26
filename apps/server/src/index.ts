@@ -4,14 +4,36 @@ import { Server } from "socket.io";
 import cors from "cors";
 import dotenv from "dotenv";
 import { DeepgramService } from "./services/deepgram.js";
-import { ClaudeAgent } from "./services/claude-agent.js";
+import { ClaudeAgent, type SentinelFinding } from "./services/claude-agent.js";
 import { MCPOrchestrator } from "./services/mcp-orchestrator.js";
 import type {
-  ServerToClientEvents,
-  ClientToServerEvents,
   SessionState,
   PipelineStatus,
 } from "./types/index.js";
+
+// Extended Socket.io event types
+interface ServerToClientEvents {
+  transcript: (data: { text: string; is_final: boolean; confidence: number }) => void;
+  intent: (data: any) => void;
+  status: (data: PipelineStatus) => void;
+  code_generated: (data: any) => void;
+  pr_created: (data: any) => void;
+  error: (message: string) => void;
+  sentinel_agent_start: (data: { agentId: string }) => void;
+  sentinel_agent_complete: (data: { agentId: string; findings: SentinelFinding[]; summary: string }) => void;
+  sentinel_agent_error: (data: { agentId: string; error: string }) => void;
+  sentinel_complete: (data: { score: number }) => void;
+  sentinel_error: (message: string) => void;
+}
+
+interface ClientToServerEvents {
+  audio: (data: ArrayBuffer) => void;
+  start_session: (config?: { targetRepo?: string }) => void;
+  end_session: () => void;
+  get_transcript: () => void;
+  process_session: () => void;
+  sentinel_analyze: (data: { targetRepo: string }) => void;
+}
 
 dotenv.config();
 
@@ -73,6 +95,10 @@ io.on("connection", (socket) => {
     try {
       initializeServices();
 
+      // Extract targetRepo from config
+      const targetRepo = config?.targetRepo || null;
+      console.log(`[SESSION] Target repo: ${targetRepo || "none (will create new)"}`);
+
       // Create session state
       const session: SessionState = {
         id: socket.id,
@@ -82,6 +108,7 @@ io.on("connection", (socket) => {
         prResult: null,
         status: { stage: "idle", message: "Session started" },
         createdAt: new Date(),
+        targetRepo: targetRepo,
       };
       sessions.set(socket.id, session);
 
@@ -104,9 +131,9 @@ io.on("connection", (socket) => {
   // Handle audio data
   let audioChunkCount = 0;
   let totalBytesReceived = 0;
-  socket.on("audio", async (data) => {
+  socket.on("audio", async (data: ArrayBuffer) => {
     audioChunkCount++;
-    const byteLength = data.byteLength || data.length || 0;
+    const byteLength = data.byteLength || 0;
     totalBytesReceived += byteLength;
 
     // Log every audio chunk for debugging
@@ -114,14 +141,14 @@ io.on("connection", (socket) => {
 
     // Log first few bytes to verify WAV header
     if (audioChunkCount === 1 && byteLength > 0) {
-      const arr = new Uint8Array(data instanceof ArrayBuffer ? data : data.buffer || data);
+      const arr = new Uint8Array(data);
       const header = Array.from(arr.slice(0, 12)).map(b => String.fromCharCode(b)).join('');
       console.log(`[AUDIO] First bytes (expecting RIFF...WAVE): "${header}"`);
     }
 
     if (deepgramService) {
       // Ensure we're sending as Buffer for Deepgram
-      const buffer = data instanceof ArrayBuffer ? Buffer.from(data) : Buffer.from(data.buffer || data);
+      const buffer = Buffer.from(new Uint8Array(data));
       deepgramService.sendAudio(buffer);
     }
   });
@@ -213,6 +240,81 @@ io.on("connection", (socket) => {
       deepgramService.close();
     }
   });
+
+  // Handle Code Sentinel analysis
+  socket.on("sentinel_analyze", async (data: { targetRepo: string }) => {
+    console.log(`[SENTINEL] Starting analysis for ${data.targetRepo}`);
+
+    try {
+      const parts = data.targetRepo.split("/");
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        socket.emit("sentinel_error", `Invalid repository format: "${data.targetRepo}". Expected "owner/repo"`);
+        return;
+      }
+
+      const [owner, repo] = parts;
+
+      // Create orchestrator to fetch repo contents
+      const sentinelOrchestrator = new MCPOrchestrator({
+        githubToken: process.env.GITHUB_TOKEN!,
+        v0ApiKey: process.env.V0_API_KEY!,
+        vercelToken: process.env.VERCEL_TOKEN,
+        anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+      });
+
+      // Fetch repository contents
+      console.log(`[SENTINEL] Fetching repository contents for ${owner}/${repo}`);
+      const repoContent = await sentinelOrchestrator.getRepositoryContents(owner, repo);
+
+      if (!repoContent.trim()) {
+        socket.emit("sentinel_error", "Could not fetch repository contents");
+        return;
+      }
+
+      console.log(`[SENTINEL] Fetched ${repoContent.length} chars of content`);
+
+      // Create Claude agent for sentinel analysis
+      const sentinelAgent = new ClaudeAgent(process.env.ANTHROPIC_API_KEY!);
+      const agentIds = ClaudeAgent.getAgentIds();
+      const scores: number[] = [];
+
+      // Run each agent analysis
+      for (const agentId of agentIds) {
+        console.log(`[SENTINEL] Starting ${agentId} agent`);
+        socket.emit("sentinel_agent_start", { agentId });
+
+        try {
+          const result = await sentinelAgent.analyzeSentinel(agentId, repoContent);
+          scores.push(result.score);
+
+          console.log(`[SENTINEL] ${agentId} complete: ${result.findings.length} findings, score: ${result.score}`);
+          socket.emit("sentinel_agent_complete", {
+            agentId: result.agentId,
+            findings: result.findings,
+            summary: result.summary,
+          });
+        } catch (error) {
+          console.error(`[SENTINEL] ${agentId} error:`, error);
+          socket.emit("sentinel_agent_error", {
+            agentId,
+            error: (error as Error).message,
+          });
+        }
+      }
+
+      // Calculate overall score (average of all agents)
+      const overallScore = scores.length > 0
+        ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
+        : 0;
+
+      console.log(`[SENTINEL] Analysis complete. Overall score: ${overallScore}`);
+      socket.emit("sentinel_complete", { score: overallScore });
+
+    } catch (error) {
+      console.error("[SENTINEL] Error:", error);
+      socket.emit("sentinel_error", (error as Error).message);
+    }
+  });
 });
 
 // Run the Voice-to-PR pipeline
@@ -242,50 +344,73 @@ async function runPipeline(
     session.generatedCode = generatedCode;
     socket.emit("code_generated", generatedCode);
 
-    // Step 2: Create repository
-    console.log(`\n[TOOL CALL] github.createRepository`);
-    const repoName = `voice-vision-${Date.now()}`;
-    console.log(`[INPUT] Name: ${repoName}`);
-    updateStatus(socket, {
-      stage: "creating_repo",
-      message: "Creating GitHub repository...",
-    });
+    let owner: string;
+    let repoName: string;
 
-    const repo = await orchestrator.createRepository({
-      name: repoName,
-      description: `Generated by VercelOS: ${session.intent!.description}`,
-      private: true,
-    });
-    console.log(`[TOOL RESULT] Created repo: ${repo.owner}/${repo.name}`);
+    // Check if using existing repo or creating new one
+    if (session.targetRepo) {
+      // Parse targetRepo (format: "owner/repo")
+      const parts = session.targetRepo.split("/");
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        throw new Error(`Invalid repository format: "${session.targetRepo}". Expected "owner/repo"`);
+      }
+      owner = parts[0];
+      repoName = parts[1];
+      console.log(`[REPO] Using existing repository: ${owner}/${repoName}`);
 
-    // Step 3: Push initial README to main branch
-    console.log(`\n[TOOL CALL] github.pushFiles (README to main)`);
-    updateStatus(socket, {
-      stage: "pushing",
-      message: "Setting up repository...",
-    });
+      updateStatus(socket, {
+        stage: "creating_repo",
+        message: `Using repository ${owner}/${repoName}...`,
+      });
+    } else {
+      // Step 2: Create new repository (fallback behavior)
+      console.log(`\n[TOOL CALL] github.createRepository`);
+      repoName = `voice-vision-${Date.now()}`;
+      console.log(`[INPUT] Name: ${repoName}`);
+      updateStatus(socket, {
+        stage: "creating_repo",
+        message: "Creating GitHub repository...",
+      });
 
-    await orchestrator.pushFiles({
-      owner: repo.owner,
-      repo: repo.name,
-      branch: "main",
-      message: "chore: initial commit",
-      files: [
-        {
-          path: "README.md",
-          content: `# ${repoName}\n\nGenerated by VercelOS\n`,
-        },
-      ],
-    });
-    console.log(`[TOOL RESULT] Pushed README to main branch`);
+      const repo = await orchestrator.createRepository({
+        name: repoName,
+        description: `Generated by VercelOS: ${session.intent!.description}`,
+        private: true,
+      });
+      owner = repo.owner;
+      console.log(`[TOOL RESULT] Created repo: ${owner}/${repoName}`);
 
-    // Step 4: Create feature branch
+      // Step 3: Push initial README to main branch (only for new repos)
+      console.log(`\n[TOOL CALL] github.pushFiles (README to main)`);
+      updateStatus(socket, {
+        stage: "pushing",
+        message: "Setting up repository...",
+      });
+
+      await orchestrator.pushFiles({
+        owner: owner,
+        repo: repoName,
+        branch: "main",
+        message: "chore: initial commit",
+        files: [
+          {
+            path: "README.md",
+            content: `# ${repoName}\n\nGenerated by VercelOS\n`,
+          },
+        ],
+      });
+      console.log(`[TOOL RESULT] Pushed README to main branch`);
+    }
+
+    // Step 4: Create feature branch with unique name
     console.log(`\n[TOOL CALL] github.createBranch`);
-    const branchName = "feature/voice-generated";
+    const branchName = session.targetRepo
+      ? `feature/voice-generated-${Date.now()}`  // Unique branch for existing repos
+      : "feature/voice-generated";                // Static branch for new repos
     console.log(`[INPUT] Branch: ${branchName}`);
     await orchestrator.createBranch({
-      owner: repo.owner,
-      repo: repo.name,
+      owner: owner,
+      repo: repoName,
       branch: branchName,
       fromBranch: "main",
     });
@@ -293,39 +418,41 @@ async function runPipeline(
 
     // Step 5: Push generated code to feature branch
     console.log(`\n[TOOL CALL] github.pushFiles (code to feature branch)`);
-    console.log(`[INPUT] Files: ${generatedCode.filePath}, package.json`);
+    console.log(`[INPUT] Files: ${generatedCode.filePath}`);
     updateStatus(socket, {
       stage: "pushing",
       message: "Pushing generated code...",
     });
 
-    await orchestrator.pushFiles({
-      owner: repo.owner,
-      repo: repo.name,
-      branch: branchName,
-      message: "feat: add generated component from Voice Vision",
-      files: [
-        {
-          path: generatedCode.filePath,
-          content: generatedCode.code,
-        },
-        {
-          path: "package.json",
-          content: JSON.stringify(
-            {
-              name: repoName,
-              version: "1.0.0",
-              dependencies: {
-                react: "^19.0.0",
-                "react-dom": "^19.0.0",
-                tailwindcss: "^3.4.0",
+    // Only include package.json for new repos
+    const filesToPush = session.targetRepo
+      ? [{ path: generatedCode.filePath, content: generatedCode.code }]
+      : [
+          { path: generatedCode.filePath, content: generatedCode.code },
+          {
+            path: "package.json",
+            content: JSON.stringify(
+              {
+                name: repoName,
+                version: "1.0.0",
+                dependencies: {
+                  react: "^19.0.0",
+                  "react-dom": "^19.0.0",
+                  tailwindcss: "^3.4.0",
+                },
               },
-            },
-            null,
-            2
-          ),
-        },
-      ],
+              null,
+              2
+            ),
+          },
+        ];
+
+    await orchestrator.pushFiles({
+      owner: owner,
+      repo: repoName,
+      branch: branchName,
+      message: "feat: add generated component from VercelOS",
+      files: filesToPush,
     });
     console.log(`[TOOL RESULT] Pushed files to feature branch`);
 
@@ -338,8 +465,8 @@ async function runPipeline(
     });
 
     const prResult = await orchestrator.createPullRequest({
-      owner: repo.owner,
-      repo: repo.name,
+      owner: owner,
+      repo: repoName,
       title: `feat: ${session.intent!.description}`,
       body: `## VercelOS Generated PR
 

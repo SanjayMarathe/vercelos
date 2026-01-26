@@ -1,6 +1,102 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Intent } from "../types/index.js";
 
+export interface SentinelFinding {
+  severity: "critical" | "warning" | "info" | "success";
+  title: string;
+  description: string;
+  file?: string;
+  line?: number;
+}
+
+export interface SentinelAgentResult {
+  agentId: string;
+  findings: SentinelFinding[];
+  summary: string;
+  score: number;
+}
+
+const SENTINEL_AGENTS = {
+  security: {
+    name: "Security Scanner",
+    prompt: `You are a security expert analyzing code for vulnerabilities. Look for:
+- SQL injection, XSS, CSRF vulnerabilities
+- Hardcoded secrets, API keys, passwords
+- Insecure authentication/authorization patterns
+- Input validation issues
+- Dependency vulnerabilities
+- Insecure data storage
+- Missing encryption
+
+Respond with JSON: { "findings": [{ "severity": "critical"|"warning"|"info"|"success", "title": "string", "description": "string", "file": "optional path", "line": "optional number" }], "summary": "1-2 sentence summary", "score": 0-100 }`,
+  },
+  quality: {
+    name: "Code Quality",
+    prompt: `You are a code quality expert. Analyze for:
+- Code duplication and DRY violations
+- Complex functions that should be refactored
+- Missing error handling
+- Poor naming conventions
+- Dead code or unused imports
+- Inconsistent coding style
+- Missing type annotations (for TS)
+
+Respond with JSON: { "findings": [{ "severity": "critical"|"warning"|"info"|"success", "title": "string", "description": "string", "file": "optional path", "line": "optional number" }], "summary": "1-2 sentence summary", "score": 0-100 }`,
+  },
+  performance: {
+    name: "Performance Analyzer",
+    prompt: `You are a performance optimization expert. Look for:
+- Memory leaks and inefficient memory usage
+- N+1 query problems
+- Missing caching opportunities
+- Expensive operations in loops
+- Unnecessary re-renders (React)
+- Large bundle sizes
+- Unoptimized assets
+
+Respond with JSON: { "findings": [{ "severity": "critical"|"warning"|"info"|"success", "title": "string", "description": "string", "file": "optional path", "line": "optional number" }], "summary": "1-2 sentence summary", "score": 0-100 }`,
+  },
+  architecture: {
+    name: "Architecture Reviewer",
+    prompt: `You are a software architect. Evaluate:
+- Separation of concerns
+- Module dependencies and coupling
+- Design pattern usage
+- API design consistency
+- Scalability concerns
+- Testing architecture
+- Folder structure organization
+
+Respond with JSON: { "findings": [{ "severity": "critical"|"warning"|"info"|"success", "title": "string", "description": "string", "file": "optional path", "line": "optional number" }], "summary": "1-2 sentence summary", "score": 0-100 }`,
+  },
+  dependencies: {
+    name: "Dependency Auditor",
+    prompt: `You are a dependency management expert. Check for:
+- Outdated packages
+- Known vulnerabilities in dependencies
+- Unnecessary dependencies
+- Missing peer dependencies
+- Version conflicts
+- License compatibility issues
+- Bundle size impact
+
+Respond with JSON: { "findings": [{ "severity": "critical"|"warning"|"info"|"success", "title": "string", "description": "string", "file": "optional path", "line": "optional number" }], "summary": "1-2 sentence summary", "score": 0-100 }`,
+  },
+  docs: {
+    name: "Documentation Checker",
+    prompt: `You are a documentation expert. Evaluate:
+- README completeness
+- API documentation
+- Code comments quality
+- JSDoc/TSDoc coverage
+- Setup instructions
+- Contributing guidelines
+- Changelog maintenance
+
+Respond with JSON: { "findings": [{ "severity": "critical"|"warning"|"info"|"success", "title": "string", "description": "string", "file": "optional path", "line": "optional number" }], "summary": "1-2 sentence summary", "score": 0-100 }`,
+  },
+};
+
 const SYSTEM_PROMPT = `You are an AI assistant that analyzes voice commands from developers to extract their intent for code generation.
 
 Your task is to:
@@ -107,5 +203,65 @@ Return only the prompt text, no explanations.`,
     }
 
     return textContent.text;
+  }
+
+  async analyzeSentinel(
+    agentId: string,
+    repoContent: string
+  ): Promise<SentinelAgentResult> {
+    const agent = SENTINEL_AGENTS[agentId as keyof typeof SENTINEL_AGENTS];
+    if (!agent) {
+      throw new Error(`Unknown sentinel agent: ${agentId}`);
+    }
+
+    try {
+      const response = await this.client.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 4096,
+        system: agent.prompt,
+        messages: [
+          {
+            role: "user",
+            content: `Analyze this codebase:\n\n${repoContent}`,
+          },
+        ],
+      });
+
+      const textContent = response.content.find((c) => c.type === "text");
+      if (!textContent || textContent.type !== "text") {
+        throw new Error("No text response from Claude");
+      }
+
+      const jsonMatch = textContent.text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        throw new Error("Could not parse sentinel response");
+      }
+
+      const result = JSON.parse(jsonMatch[0]);
+      return {
+        agentId,
+        findings: result.findings || [],
+        summary: result.summary || "Analysis complete",
+        score: result.score || 50,
+      };
+    } catch (error) {
+      console.error(`Sentinel ${agentId} error:`, error);
+      return {
+        agentId,
+        findings: [
+          {
+            severity: "warning",
+            title: "Analysis Error",
+            description: `Failed to complete ${agent.name} analysis: ${(error as Error).message}`,
+          },
+        ],
+        summary: "Analysis encountered an error",
+        score: 0,
+      };
+    }
+  }
+
+  static getAgentIds(): string[] {
+    return Object.keys(SENTINEL_AGENTS);
   }
 }

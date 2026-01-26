@@ -27,7 +27,9 @@ export interface Intent {
 export interface PipelineStatus {
   stage:
     | "idle"
+    | "recording"
     | "transcribing"
+    | "ready"
     | "analyzing"
     | "generating"
     | "creating_repo"
@@ -62,6 +64,7 @@ export interface SessionState {
   prResult: PRResult | null;
   status: PipelineStatus;
   createdAt: Date;
+  targetRepo?: string | null;
 }
 
 // Socket.io Events

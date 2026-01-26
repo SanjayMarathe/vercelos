@@ -21,7 +21,12 @@ export class DeepgramService extends EventEmitter {
   }
 
   sendAudio(audioData: ArrayBuffer | Buffer): void {
-    const buffer = audioData instanceof Buffer ? audioData : Buffer.from(audioData);
+    let buffer: Buffer;
+    if (Buffer.isBuffer(audioData)) {
+      buffer = audioData;
+    } else {
+      buffer = Buffer.from(new Uint8Array(audioData));
+    }
     console.log(`[DEEPGRAM] Buffering ${buffer.byteLength} bytes`);
     this.audioChunks.push(buffer);
   }

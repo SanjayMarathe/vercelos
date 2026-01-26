@@ -253,6 +253,14 @@ Requirements:
       .join("");
   }
 
+  async getRepositoryContents(owner: string, repo: string): Promise<string> {
+    return this.github.getRepositoryContents(owner, repo);
+  }
+
+  getClaudeAgent(): ClaudeAgent | null {
+    return this.claude;
+  }
+
   private buildPRBody(
     intent: Intent,
     transcript: string,

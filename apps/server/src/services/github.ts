@@ -167,4 +167,97 @@ export class GitHubService {
       url: data.html_url,
     };
   }
+
+  async getRepositoryContents(
+    owner: string,
+    repo: string,
+    path: string = ""
+  ): Promise<string> {
+    const contents: string[] = [];
+    const maxFiles = 20; // Limit files to avoid token limits
+    let fileCount = 0;
+
+    const fetchContents = async (currentPath: string): Promise<void> => {
+      if (fileCount >= maxFiles) return;
+
+      try {
+        const { data } = await this.octokit.repos.getContent({
+          owner,
+          repo,
+          path: currentPath,
+        });
+
+        if (Array.isArray(data)) {
+          // Directory
+          for (const item of data) {
+            if (fileCount >= maxFiles) break;
+
+            // Skip common non-essential directories
+            if (
+              item.name === "node_modules" ||
+              item.name === ".git" ||
+              item.name === "dist" ||
+              item.name === "build" ||
+              item.name === ".next" ||
+              item.name === "coverage"
+            ) {
+              continue;
+            }
+
+            if (item.type === "dir") {
+              await fetchContents(item.path);
+            } else if (item.type === "file") {
+              // Only fetch code files
+              const ext = item.name.split(".").pop()?.toLowerCase();
+              const codeExtensions = [
+                "ts",
+                "tsx",
+                "js",
+                "jsx",
+                "py",
+                "go",
+                "rs",
+                "java",
+                "json",
+                "yaml",
+                "yml",
+                "md",
+                "css",
+                "scss",
+              ];
+
+              if (ext && codeExtensions.includes(ext) && item.size < 50000) {
+                try {
+                  const { data: fileData } = await this.octokit.repos.getContent(
+                    {
+                      owner,
+                      repo,
+                      path: item.path,
+                    }
+                  );
+
+                  if (!Array.isArray(fileData) && fileData.type === "file") {
+                    const content = Buffer.from(
+                      fileData.content,
+                      "base64"
+                    ).toString("utf-8");
+                    contents.push(`\n--- ${item.path} ---\n${content}`);
+                    fileCount++;
+                  }
+                } catch {
+                  // Skip files that can't be read
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // Directory doesn't exist or can't be read
+      }
+    };
+
+    await fetchContents(path);
+
+    return contents.join("\n");
+  }
 }
